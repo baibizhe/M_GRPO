@@ -15,6 +15,7 @@
 
 from verl.utils.import_utils import deprecated
 
+from typing import Optional
 
 def default_compute_score(
     data_source,
@@ -55,6 +56,9 @@ def default_compute_score(
 
         # from . import math_verify
         # res = math_verify.compute_score(solution_str, ground_truth)
+    elif 'MATH-lighteval' in data_source:
+        from . import math
+        res = math.compute_score(solution_str, ground_truth)
     elif data_source == "math_dapo" or data_source.startswith("aime"):
         from . import math_dapo
 
@@ -130,5 +134,49 @@ def _default_compute_score(
         data_source, solution_str, ground_truth, extra_info, sandbox_fusion_url, concurrent_semaphore, memory_limit_mb
     )
 
+  
 
+def _extract_verifiable_part_of_solution(
+    data_source: str,
+    solution_str: str,
+) -> Optional[str]:
+    if data_source == 'countdown':
+        from . import countdown
+        result = countdown.extract_solution(solution_str=solution_str)
+
+    elif data_source == 'openai/gsm8k':
+        from . import gsm8k
+        result = gsm8k.extract_solution(solution_str=solution_str)
+
+    elif data_source in ['lighteval/MATH', 'DigitalLearningGmbH/MATH-lighteval']:
+        from . import math_verify
+        result = math_verify.extract_solution(solution_str=solution_str)
+    elif 'MATH-lighteval' in data_source:
+        from . import math_verify
+        result = math_verify.extract_solution(solution_str=solution_str)
+
+    # For AIME, we use the same parser/solution extractor as MATH
+    elif "AIME" in data_source:
+        from . import math_verify
+        result = math_verify.extract_solution(solution_str=solution_str)
+
+    # For DAPO, we use the same parser/solution extractor as MATH
+    elif data_source == "math_dapo":
+        from . import math_verify
+        result = math_verify.extract_solution(solution_str=solution_str)
+
+    # for the six evaluation sources, MATH parser works just as well:
+    elif data_source in ["math500", "aime24", "aime25", "minerva_math", "olympiadbench", "amc23"]: 
+        from . import math_verify
+        result = math_verify.extract_solution(solution_str=solution_str)
+
+    # For NUMINA-MATH, we also use the MATH parser:
+    elif data_source == "numina_math":
+        from . import math_verify
+        result = math_verify.extract_solution(solution_str=solution_str)
+
+    else:
+        raise NotImplementedError(f"Solution extraction method not implemented for data source {data_source}")
+    
+    return result
 __all__ = ["default_compute_score"]

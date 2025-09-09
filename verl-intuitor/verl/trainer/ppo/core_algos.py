@@ -103,6 +103,7 @@ def get_adv_estimator_fn(name_or_enum):
         `(callable)`: The advantage estimator function.
     """
     name = name_or_enum.value if isinstance(name_or_enum, Enum) else name_or_enum
+    print(f'ADV_ESTIMATOR_REGISTRY:{ADV_ESTIMATOR_REGISTRY}')
     if name not in ADV_ESTIMATOR_REGISTRY:
         raise ValueError(f"Unknown advantage estimator simply: {name}")
     return ADV_ESTIMATOR_REGISTRY[name]
@@ -127,6 +128,7 @@ class AdvantageEstimator(str, Enum):
     GRPO_PASSK = "grpo_passk"
     GPG = "gpg"
     INTUITOR = "intuitor"
+    M_GRPO = "m_grpo"
 
 
 class AdaptiveKLController:

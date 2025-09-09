@@ -17,6 +17,7 @@ Note that we don't combine the main with ray_trainer as ray_trainer is used by o
 
 import os
 import socket
+from omegaconf import open_dict
 
 import hydra
 import ray
@@ -132,6 +133,7 @@ class TaskRunner:
             if config.actor_rollout_ref.model.get("lora_rank", 0) > 0:
                 if not is_version_ge(pkg="vllm", minver="0.7.3"):
                     raise NotImplementedError("PPO LoRA is not supported before vllm 0.7.3")
+        print(' 135. self.config.rollout.name!!!! == vllm'*10,flush=True)
 
         # Define worker classes based on the actor strategy.
         if config.actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}:
@@ -200,6 +202,20 @@ class TaskRunner:
         if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
             role_worker_mapping[Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
             mapping[Role.RefPolicy] = global_pool_id
+        reward_manager_name = config.reward_model.get("reward_manager", "naive")
+
+        # if reward_manager_name == "m_grpo":
+        #     # 先拿到默认阈值
+        #     thr = config.reward_model.get("self_consistency_threshold", 0.6)
+
+        #     # 对 reward_model 这个节点临时解锁，允许新增/修改键
+        #     with open_dict(config.reward_model):
+        #         # 若不存在就创建
+        #         if "reward_kwargs" not in config.reward_model:
+        #             config.reward_model["reward_kwargs"] = {}
+        #         # 写入/更新
+        #         config.reward_model["reward_kwargs"]["self_consistency_threshold"] = thr
+
 
         # Load the reward manager for training and validation.
         reward_fn = load_reward_manager(
@@ -234,7 +250,10 @@ class TaskRunner:
             device_name=config.trainer.device,
         )
         # Initialize the workers of the trainer.
-        trainer.init_workers()
+        trainer.init_workers() 
+        # 这里会init_model(self):            self.rollout, self.rollout_sharding_manager,momentum_rollout,momentum_rollout_sharding_manager = self._build_rollout(
+        # trust_remote_code=self.config.model.get("trust_remote_code", False))
+        
         # Start the training process.
         trainer.fit()
 

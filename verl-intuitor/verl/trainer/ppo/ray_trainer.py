@@ -63,6 +63,110 @@ from verl.utils.tracking import ValidationGenerationsLogger
 
 WorkerType = Type[Worker]
 
+# --- Fix A: reorder concatenated rollouts to per-prompt contiguous layout ---
+import torch
+from copy import deepcopy
+from typing import Optional
+from verl import DataProto
+
+def _first_dim_size(dp: DataProto) -> int:
+    # infer batch size from the first tensor field
+    for _k, v in dp.batch.items():
+        return v.shape[0]
+    raise ValueError("Empty DataProto batch")
+
+def concat_rollouts_fixA(
+    out_actor: DataProto,
+    out_momentum: DataProto,
+    *,
+    B: Optional[int] = None,          # original (unrepeated) prompt batch size
+    n_actor: Optional[int] = None,    # #responses per prompt from actor
+    n_momentum: Optional[int] = None  # #responses per prompt from momentum
+) -> DataProto:
+    """
+    Reorder the simple concatenation [p1×nA, p2×nA, …, pB×nA, p1×nM, p2×nM, …, pB×nM]
+    into per-prompt blocks expected by repeat(..., interleave=True):
+    [p1×(nA+nM), p2×(nA+nM), …, pB×(nA+nM)].
+
+    Returns a new DataProto ready to `union` with a driver batch that was
+    repeated with `repeat_times = n_actor + n_momentum, interleave=True`.
+    """
+    # sizes
+    SA = _first_dim_size(out_actor)     # SA == B * n_actor
+    SM = _first_dim_size(out_momentum)  # SM == B * n_momentum
+
+    # Infer B / n_actor / n_momentum if some are not provided
+    if B is None and (n_actor is not None):
+        assert SA % n_actor == 0, f"Actor size {SA} not divisible by n_actor {n_actor}."
+        B = SA // n_actor
+    if B is None and (n_momentum is not None):
+        assert SM % n_momentum == 0, f"Momentum size {SM} not divisible by n_momentum {n_momentum}."
+        B = SM // n_momentum
+    if n_actor is None:
+        assert B is not None and SA % B == 0, f"Cannot infer n_actor from SA={SA}, B={B}."
+        n_actor = SA // B
+    if n_momentum is None:
+        assert B is not None and SM % B == 0, f"Cannot infer n_momentum from SM={SM}, B={B}."
+        n_momentum = SM // B
+
+    # Final combined count
+    n_total = n_actor + n_momentum
+    N = B * n_total
+
+    # 1) Build a concatenated DataProto once, so we only reorder a single object.
+    out_concat = DataProto.concat([out_actor, out_momentum])  # [B*nA + B*nM, ...] == [N, ...]
+    # 2) Build permutation that interleaves per prompt.
+    # actor block for prompt i: [i*nA : (i+1)*nA)
+    # momentum block for prompt i: [B*nA + i*nM : B*nA + (i+1)*nM)
+    perm = torch.empty(N, dtype=torch.long)
+    w = 0
+    for i in range(B):
+        startA = i * n_actor
+        startM = B * n_actor + i * n_momentum
+        perm[w : w + n_actor] = torch.arange(startA, startA + n_actor)
+        w += n_actor
+        perm[w : w + n_momentum] = torch.arange(startM, startM + n_momentum)
+        w += n_momentum
+    assert w == N
+
+    # 3) Reindex every tensor field by perm (only those whose first dim is N)
+    new_dp = deepcopy(out_concat)  # keep meta_info and structure
+    for k, v in list(new_dp.batch.items()):
+        if v.shape[0] == N:
+            new_dp.batch[k] = v.index_select(0, perm.to(v.device))
+        # else: leave it as-is (some auxiliary fields may be scalars)
+
+    # 4) (Optional) Reorder non-tensor fields if present and aligned
+    if hasattr(new_dp, "non_tensor_batch") and new_dp.non_tensor_batch:
+        import numpy as np
+        perm_np = perm.cpu().numpy()
+        for k, vals in list(new_dp.non_tensor_batch.items()):
+            try:
+                arr = np.asarray(vals, dtype=object)
+                if len(arr) == N:
+                    new_dp.non_tensor_batch[k] = arr[perm_np]
+            except Exception:
+                # ignore unaligned metadata
+                pass
+
+    # 5) Quick sanity check: per-prompt prompt rows should match within each group
+    if "prompts" in new_dp.batch:
+        prom = new_dp.batch["prompts"]
+        # prom shape: [N, prompt_len]
+        prompt_len = prom.shape[1]
+        # Check that the B groups are internally consistent
+        with torch.no_grad():
+            ok = 0
+            for i in range(B):
+                block = prom[i * n_total : (i + 1) * n_total]
+                # all rows in the block should equal the first row
+                if (block == block[0]).all():
+                    ok += 1
+            if ok != B:
+                print(f"[FixA] WARNING: only {ok}/{B} prompt groups are consistent after reorder.")
+
+    return new_dp, n_total
+# --- end Fix A helper ---
 
 class Role(Enum):
     """
@@ -403,6 +507,7 @@ class RayPPOTrainer:
             AdvantageEstimator.REINFORCE_PLUS_PLUS_BASELINE,
             AdvantageEstimator.GPG,
             AdvantageEstimator.INTUITOR,
+            AdvantageEstimator.M_GRPO,
         ]:
             self.use_critic = False
         else:
@@ -1172,10 +1277,18 @@ class RayPPOTrainer:
                     batch_keys=batch_keys_to_pop,
                     non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
                 )
+                B = gen_batch.batch["input_ids"].shape[0]  # original (unrepeated) batch size
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
-                gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                n_total = int(self.config.actor_rollout_ref.rollout.n)
+                # n_momentum = max(1, n_total // 4)       # e.g., 4
+                # n_actor    = n_total - n_momentum       # e.g., 4
+                n_actor    = n_total      # e.g., 4
+
+                gen_batch_actor    = gen_batch.repeat(repeat_times=n_actor,    interleave=True)
+                # gen_batch_momentum = gen_batch.repeat(repeat_times=n_momentum, interleave=True)
+                # gen_batch_momentum = gen_batch.repeat(repeat_times=int(self.config.actor_rollout_ref.rollout.n/2), interleave=True)
 
                 is_last_step = self.global_steps >= self.total_training_steps
 
@@ -1183,11 +1296,34 @@ class RayPPOTrainer:
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
                         if not self.async_rollout_mode:
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_actor)
+                            # gen_batch_output_momentum = self.actor_rollout_wg.generate_sequences_momentum(gen_batch_momentum)
+                            print(f'gen_batch_output {gen_batch_output.batch}')
+                            # print(f'gen_batch_output_momentum {gen_batch_output_momentum.batch}')
+                            
+                            # gen_batch_output, n_total = concat_rollouts_fixA(
+                            #     gen_batch_output,
+                            #     gen_batch_output_momentum,
+                            #     B=B,
+                            #     n_actor=n_actor,
+                            #     n_momentum=n_momentum,
+                            # )      
+                            # print(f'gen_batch_output after concat:{gen_batch_output.batch}')                      
+                                                        
+                            # print(f'gen_batch_output_momentum {gen_batch_output_momentum.batch}')
+                            # print(f'gen_batch_output[responses] == gen_batch_output_momentum[responses] : {gen_batch_output.batch["responses"] == gen_batch_output_momentum.batch["responses"]}')
+                            # print(gen_batch_output.batch['responses'][0])
+                            # print(gen_batch_output_momentum.batch['responses'][0])
+                            # print('gen_batch_output_k',len(gen_batch_output_k))
+                            # print('gen_batch_output',len(gen_batch_output))
                         else:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
-                        timing_raw.update(gen_batch_output.meta_info["timing"])
-                        gen_batch_output.meta_info.pop("timing", None)
+                            # gen_batch_output_k = self.actor_rollout_wg.generate_sequences_momentum(gen_batch)
+                            # print('gen_batch_output_k',gen_batch_output_k.shape)
+                            # print('gen_batch_output',gen_batch_output.shape)
+
+                        # timing_raw.update(gen_batch_output.meta_info["timing"])
+                        # gen_batch_output.meta_info.pop("timing", None)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with marked_timer("gen_max", timing_raw, color="purple"):
@@ -1211,7 +1347,11 @@ class RayPPOTrainer:
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
-
+                    uids = batch.non_tensor_batch["uid"]
+                    assert len(uids) == B * n_total
+                    for i in range(B):
+                        blk = uids[i*n_total:(i+1)*n_total]
+                        assert len(set(blk)) == 1, "UIDs are not contiguous per prompt!"
                     if "response_mask" not in batch.batch:
                         batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.

@@ -39,7 +39,7 @@ if __name__ == "__main__":
 
     # 'lighteval/MATH' is no longer available on huggingface.
     # Use mirror repo: DigitalLearningGmbH/MATH-lighteval
-    data_source = "DigitalLearningGmbH/MATH-lighteval"
+    data_source = "/inspire/hdd/project/robot-dna/sujiadi-p-sujiadi/baibizhe-tmp/r1-reasoning/rft_pruning/data/MATH-lighteval"
     print(f"Loading the {data_source} dataset from huggingface...", flush=True)
     dataset = datasets.load_dataset(data_source, trust_remote_code=True)
 

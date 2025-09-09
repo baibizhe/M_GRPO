@@ -14,6 +14,7 @@
 """
 The main entry point to run the PPO algorithm
 """
+from copy import deepcopy  # at top of file
 
 import json
 import logging
@@ -73,12 +74,30 @@ from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerCon
 from verl.utils.profiler.performance import reduce_timing
 from verl.utils.py_functional import convert_to_regular_types
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
+import contextlib
+import torch
+from torch.distributed import barrier, is_initialized as dist_is_initialized
 
+try:
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    _HAS_FSDP = True
+except Exception:
+    _HAS_FSDP = False
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
 
+def _is_fsdp(m):
+    return _HAS_FSDP and isinstance(m, FSDP)
+
+
+def _iter_named_params_and_buffers(module):
+    # Yield (name, tensor, is_buffer) across params and buffers
+    for n, p in module.named_parameters(recurse=True):
+        yield n, p, False
+    for n, b in module.named_buffers(recurse=True):
+        yield n, b, True
 
 def create_device_mesh(world_size, fsdp_size):
     if fsdp_size < 0 or fsdp_size >= world_size:
@@ -212,7 +231,49 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_ref and self.config.ref.log_prob_micro_batch_size is not None:
             self.config.ref.log_prob_micro_batch_size //= self.device_mesh.size() // self.ulysses_sequence_parallel_size
             self.config.ref.log_prob_micro_batch_size_per_gpu = self.config.ref.log_prob_micro_batch_size
+    @torch.no_grad()
+    def update_momentum_rollout(self, m: float = 1):
+        """
+        EMA update of momentum policy from actor policy:
+            θ_k ← m * θ_k + (1 - m) * θ_q
+        """
+        assert hasattr(self, "actor_module_fsdp"), "Actor module missing."
+        assert hasattr(self, "momentum_module_fsdp"), "Momentum module missing."
+        # assert 0.0 <= m < 1.0, f"m must be in [0,1); got {m}"
 
+        actor = self.actor_module_fsdp
+        momentum = self.momentum_module_fsdp
+
+        # --- FSDP2 path ---
+        # if "fsdp2" in str(fsdp_version()).lower():
+        #     from torch.distributed._composable.fsdp import unshard
+
+        #     with unshard(actor), unshard(momentum):
+        #         q_params = dict(actor.named_parameters(remove_duplicate=False))
+        #         for name, p_k in momentum.named_parameters(remove_duplicate=False):
+        #             p_q = q_params.get(name, None)
+        #             if p_q is None or not p_k.dtype.is_floating_point:
+        #                 continue
+        #             # EMA: θ_k ← m·θ_k + (1-m)·θ_q
+        #             p_k.mul_(m).add_(p_q.to(dtype=p_k.dtype, device=p_k.device), alpha=(1.0 - m))
+
+        # # --- FSDP1 path ---
+        # else:
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        with FSDP.summon_full_params(actor,    writeback=False, with_grads=False), \
+                FSDP.summon_full_params(momentum, writeback=True,  with_grads=False):
+            q_params = dict(actor.named_parameters())
+            for name, p_k in momentum.named_parameters():
+                p_q = q_params.get(name, None)
+                if p_q is None or not p_k.dtype.is_floating_point:
+                    continue
+                # EMA: θ_k ← m·θ_k + (1-m)·θ_q
+                p_k.mul_(m).add_(p_q.to(dtype=p_k.dtype, device=p_k.device), alpha=(1.0 - m))
+        # print('update_momentum_rollout!!!'*10)
+        # If your sharding manager caches weights, invalidate its cache
+        if hasattr(self, "momentum_rollout_sharding_manager") and \
+           hasattr(self.momentum_rollout_sharding_manager, "invalidate_cached_weights"):
+            self.momentum_rollout_sharding_manager.invalidate_cached_weights()
     def _build_model_optimizer(
         self,
         model_path,
@@ -485,6 +546,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             # TODO: a sharding manager that do nothing?
 
         elif rollout_name == "vllm":
+            # print('elif rollout_name == "vllm":!!!!!!!'*20)
             from verl.workers.rollout.vllm_rollout import vLLMRollout
             from verl.workers.sharding_manager.fsdp_vllm import FSDPVLLMShardingManager
 
@@ -497,6 +559,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             )
             # lora_kwargs = {}
             from verl.workers.rollout.vllm_rollout import vLLMAsyncRollout
+            print('local_path',local_path,'rollout_device_mesh',rollout_device_mesh,f"lora_kwargs: {lora_kwargs}")
 
             vllm_rollout_cls = vLLMRollout if self.config.rollout.mode == "sync" else vLLMAsyncRollout
             rollout = vllm_rollout_cls(
@@ -508,6 +571,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 trust_remote_code=trust_remote_code,
                 **lora_kwargs,
             )
+            
+            vllm_rollout_cls = vLLMRollout if self.config.rollout.mode == "sync" else vLLMAsyncRollout
+            momentum_rollout = vllm_rollout_cls(
+                model_path=local_path,
+                config=self.config.rollout,
+                tokenizer=self.tokenizer,
+                model_hf_config=self.actor_model_config,
+                device_mesh=rollout_device_mesh,
+                trust_remote_code=trust_remote_code,
+                **lora_kwargs,
+            )
+            print('momentum_rollout',momentum_rollout)
 
             log_gpu_memory_usage(f"After building {rollout_name} rollout", logger=logger)
             full_params = torch.distributed.get_world_size() == 1
@@ -523,7 +598,31 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 layered_summon=self.config.rollout.get("layered_summon", False),
             )
             log_gpu_memory_usage("After building sharding manager", logger=logger)
-
+            # momentum_rollout_sharding_manager = FSDPVLLMShardingManager(
+            #     # module=self.actor_module_fsdp,
+            #     module=self.momentum_actor_module_fsdp,
+            #     inference_engine=momentum_rollout.inference_engine,
+            #     model_config=self.actor_model_config,
+            #     rollout_config=self.config.rollout,
+            #     full_params=full_params,
+            #     device_mesh=rollout_device_mesh,
+            #     offload_param=self._is_offload_param,
+            #     load_format=self.config.rollout.load_format,
+            #     layered_summon=self.config.rollout.get("layered_summon", False),
+            # )
+            momentum_rollout_sharding_manager = FSDPVLLMShardingManager(
+                module=self.momentum_module_fsdp,
+                inference_engine=momentum_rollout.inference_engine,
+                model_config=self.actor_model_config,
+                rollout_config=self.config.rollout,
+                full_params=(torch.distributed.get_world_size() == 1),
+                device_mesh=rollout_device_mesh,
+                offload_param=self._is_offload_param,
+                load_format=self.config.rollout.load_format,
+                layered_summon=self.config.rollout.get("layered_summon", False),
+            )
+            print('momentum_rollout_sharding_manager',momentum_rollout_sharding_manager)
+            
         elif rollout_name == "sglang":
             from verl.workers.rollout.sglang_rollout import SGLangRollout
 
@@ -564,7 +663,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         else:
             raise NotImplementedError(f"Rollout name: {self.config.rollout.name} is not supported")
 
-        return rollout, rollout_sharding_manager
+        return rollout, rollout_sharding_manager,momentum_rollout,momentum_rollout_sharding_manager
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
@@ -607,6 +706,20 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 role="actor",
                 enable_activation_offload=self.config.model.get("enable_activation_offload", False),
             )
+            self.momentum_module_fsdp, _, _, _ = self._build_model_optimizer(
+                model_path=local_path,
+                fsdp_config=fsdp_config,
+                optim_config=optim_config,
+                override_model_config=override_model_config,
+                use_remove_padding=use_remove_padding,
+                use_fused_kernels=use_fused_kernels,
+                enable_gradient_checkpointing=self.config.model.get("enable_gradient_checkpointing", False),
+                trust_remote_code=self.config.model.get("trust_remote_code", False),
+                use_liger=self.config.model.get("use_liger", False),
+                role="actor",
+                enable_activation_offload=self.config.model.get("enable_activation_offload", False),
+            )
+            print('succesfully build momentum_module_fsdp')
 
             # get the original unwrapped module
             if fsdp_version(self.actor_module_fsdp) == 1:
@@ -630,7 +743,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             )
 
         if self._is_rollout:
-            self.rollout, self.rollout_sharding_manager = self._build_rollout(
+            self.rollout, self.rollout_sharding_manager,self.momentum_rollout,self.momentum_rollout_sharding_manager = self._build_rollout(
                 trust_remote_code=self.config.model.get("trust_remote_code", False)
             )
 
@@ -702,7 +815,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
             metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
             metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
-
+            # Use a config knob if you like; here hard-coded 0.99 for clarity.
+            self.update_momentum_rollout(m=0.99)
+            # <<< END ADD >>>
             lr = self.actor_lr_scheduler.get_last_lr()[0]
             metrics["actor/lr"] = lr
             self.actor_lr_scheduler.step()
@@ -724,8 +839,46 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     @DistProfiler.annotate(color="red", role="rollout_generate")
+    def generate_sequences_momentum(self, prompts: DataProto):
+        # identical prologue
+        prompts = prompts.to(get_device_id())
+        assert self._is_rollout
+
+        meta_info = {
+            "eos_token_id": self.generation_config.eos_token_id
+                if self.generation_config is not None else self.tokenizer.eos_token_id,
+            "pad_token_id": self.generation_config.pad_token_id
+                if self.generation_config is not None else self.tokenizer.pad_token_id,
+        }
+        prompts.meta_info.update(meta_info)
+
+        timing_generate = {}
+        with self.momentum_rollout_sharding_manager:
+            log_gpu_memory_usage("After entering MOMENTUM rollout sharding manager", logger=logger)
+
+            # IMPORTANT: don't reuse the in-place preprocessed object from a previous call
+            # Always preprocess from the original 'prompts' passed into this function.
+            prompts_proc = self.momentum_rollout_sharding_manager.preprocess_data(prompts)
+
+            with simple_timer("generate_sequences_momentum", timing_generate):
+                output = self.momentum_rollout.generate_sequences(prompts=prompts_proc)
+
+            log_gpu_memory_usage("After MOMENTUM rollout generation", logger=logger)
+            output = self.momentum_rollout_sharding_manager.postprocess_data(output)
+
+        timing_generate.update(self.momentum_rollout_sharding_manager.timing)
+        timing_generate = reduce_timing(timing_generate)
+        output.meta_info["timing_momentum"] = timing_generate
+        output = output.to("cpu")
+
+        get_torch_device().empty_cache()
+        return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    @DistProfiler.annotate(color="red", role="rollout_generate")
     def generate_sequences(self, prompts: DataProto):
         # Support all hardwares
+        print('generate_sequences function inside ! fsdp_workers!!!'*20,)
         prompts = prompts.to(get_device_id())
 
         assert self._is_rollout

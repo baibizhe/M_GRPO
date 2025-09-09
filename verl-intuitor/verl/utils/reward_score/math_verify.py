@@ -13,11 +13,11 @@
 # limitations under the License.
 
 try:
-    from math_verify.errors import TimeoutException
     from math_verify.metric import math_metric
     from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig
 except ImportError:
     print("To use Math-Verify, please install it first by running `pip install math-verify`.")
+from verl.utils.reward_score.math import remove_boxed, last_boxed_only_string
 
 
 def compute_score(model_output: str, ground_truth: str, timeout_score: float = 0) -> bool:
@@ -33,7 +33,16 @@ def compute_score(model_output: str, ground_truth: str, timeout_score: float = 0
         ret_score, _ = verify_func([ground_truth_boxed], [model_output])
     except Exception:
         pass
-    except TimeoutException:
-        ret_score = timeout_score
+
 
     return ret_score
+def extract_solution(solution_str: str) -> str:
+    solution_substr = last_boxed_only_string(solution_str)
+    if solution_substr is None:
+        return None
+    try:
+        box_removed = remove_boxed(solution_substr)
+    except:
+        box_removed = None
+
+    return box_removed

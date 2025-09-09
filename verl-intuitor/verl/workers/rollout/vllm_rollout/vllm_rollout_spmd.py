@@ -93,6 +93,7 @@ class vLLMRollout(BaseRollout):
             "tensor parallel size should be less than or equal to the world size"
         )
         max_num_batched_tokens = self.config.get("max_num_batched_tokens", 8192)
+        print('96 vLLMRollout init !!!! == vllm'*10,flush=True)
 
         if kwargs.get("train_tp") is not None:
             # deployed with megatron

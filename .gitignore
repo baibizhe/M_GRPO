@@ -18,6 +18,9 @@ downloads/
 eggs/
 .eggs/
 lib/
+output_dir/
+tensorboard_log/
+wandb/
 lib64/
 parts/
 sdist/

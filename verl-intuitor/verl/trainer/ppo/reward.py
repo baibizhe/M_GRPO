@@ -105,7 +105,11 @@ def load_reward_manager(config, tokenizer, num_examine, **reward_kwargs):
     # registered via `verl.workers.reward_manager.register`
     # By default reward_manager is set to naive (NaiveRewardManager)
     reward_manager_name = config.reward_model.get("reward_manager", "naive")
-    reward_manager_cls = get_reward_manager_cls(reward_manager_name)
+    if reward_manager_name =='m_grpo':
+        from verl.workers.reward_manager import M_grpo_RewardManager
+        reward_manager_cls = M_grpo_RewardManager
+    else:
+        reward_manager_cls = get_reward_manager_cls(reward_manager_name)
 
     # Try to get a custom reward function based on the configuration
     compute_score = get_custom_reward_fn(config)
