@@ -8,6 +8,10 @@
 Self-supervised reinforcement learning (RL) presents a promising avenue for enhancing the reasoning capabilities of LLMs without reliance on expensive human-annotated data. However, existing methods are prone to "policy collapse," a phenomenon where the learning process becomes unstable during extended training, leading to a sharp degradation in both reward and task performance. This paper diagnoses this instability, attributing it to the lack of a stable target in self-rewarding systems. To address this, we introduce M-GRPO, a  momentum-anchored method that leverages a slowly evolving momentum model to provide a consistent and reliable training signal, stabilizing the generation of pseudo-labels for policy optimization. Our experiments, conducted on the MATH dataset, demonstrate that M-GRPO effectively prevents policy collapse, maintaining a stable training reward and consistently high validation accuracy. 
 ![Xnip2025-09-12_00-58-07](https://github.com/user-attachments/assets/f232251f-ed62-41df-bdbc-9c6ba7b50ee3)
 
+
+# 🎉News
+- **[2025-10-16]** M_GRPO paper is accepted to [NeurIPS 2025 Workshop onEfficient Reasoning](https://efficient-reasoning.github.io/)! . The final version of code and paper will be updated.
+
 ## How to use
 First, download the MATH dataset and prepare it using the following Python script:
 
